@@ -14,7 +14,7 @@ lsl_out = False
 MODE = "bci" # "testing (keyboard controls)" or "bci"
 CALIBRATION_MODE = False
 N_PER_CLASS = 2
-RUN = 4
+RUN = 2
 LANES = 5
 
 
@@ -26,8 +26,10 @@ aspect_ratio = width / height
 refresh_rate = 60.02
 stim_duration = 1.2
 baseline_duration = 0.2
+warning_duration = 0.8
+movement_duration = 1.2
 baseline_duration_samples = int(baseline_duration * 250)
-num_obstacles = 4
+num_obstacles = 2
 PRE_STIM_PAUSE = 0.6
 N_EEG_CHANNELS = 8
 
@@ -435,7 +437,7 @@ def obstacle_warning_phase():
     blocked = set(random.sample(range(LANES), num_obstacles))
     spawn_obstacles(blocked)
     t0 = core.getTime()
-    while core.getTime() - t0 < 0.8:
+    while core.getTime() - t0 < warning_duration:
         if "escape" in event.getKeys(keyList=["escape"]):
             quit_clean()
         for i, r in enumerate(lane_rects):
@@ -509,8 +511,8 @@ def movement_phase(new_lane):
         r.fillColor = [-1, -1, -1]
     t0     = core.getTime()
     last_t = t0
-    speed  = 1.6
-    while core.getTime() - t0 < 1.2:
+    speed  = 2 / movement_duration
+    while core.getTime() - t0 < movement_duration:
         if "escape" in event.getKeys(keyList=["escape"]):
             save_data()
             quit_clean()
