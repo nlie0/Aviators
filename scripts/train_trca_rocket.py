@@ -269,7 +269,10 @@ baseline_average = np.mean(combined_eeg_trials[:, :, :, :baseline_samples], axis
 baseline_corrected_eeg_trials = combined_eeg_trials - baseline_average
 cropped_eeg_trials = combined_eeg_trials[:, :, :, baseline_samples:]
 
-cm, acc, model = run_fbtrca(cropped_eeg_trials, target_by_trial, target_tab, duration=1.2, onset_delay=0, ensamble=True, print_acc=True, srate=250)
+actual_duration = cropped_eeg_trials.shape[-1] / 250
+cm, acc, model = run_fbtrca(cropped_eeg_trials, target_by_trial, target_tab, duration=actual_duration, onset_delay=0, ensamble=True, print_acc=True, srate=250)
+
+# cm, acc, model = run_fbtrca(cropped_eeg_trials, target_by_trial, target_tab, duration=1.2, onset_delay=0, ensamble=True, print_acc=True, srate=250)
 
 os.makedirs(model_save_dir, exist_ok=True)
 with open(model_save_dir + model_name, 'wb') as f:
