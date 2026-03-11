@@ -6,14 +6,11 @@ import pandas as pd
 import mne
 from sklearn.metrics import confusion_matrix, accuracy_score
 from brainda.algorithms.utils.model_selection import (
-    set_random_seeds,
-    generate_loo_indices,
-    match_loo_indices,
-)
+    set_random_seeds, 
+    generate_loo_indices, match_loo_indices)
 from brainda.algorithms.decomposition import (
     FBTRCA, FBTDCA, FBSCCA, FBECCA, FBDSP,
-    generate_filterbank, generate_cca_references
-)
+    generate_filterbank, generate_cca_references)
 from collections import OrderedDict
 from sklearn.pipeline import clone
 from sklearn.metrics import balanced_accuracy_score
@@ -23,276 +20,257 @@ from matplotlib.colors import LogNorm
 import os, pickle
 import argparse
 
-# same STIMULUS_CLASSES in run_rocket.py
-STIMULUS_CLASSES = [
-    (8, 0),
-    (10, 0),
-    (12, 0),
-    (14, 0),
-    (15, 0),
-]
-N_CLASSES      = len(STIMULUS_CLASSES)  # 5
-N_PER_CLASS    = 2                      # must match N_PER_CLASS used during calibration
-N_EEG_CHANNELS = 8
-SAMPLING_RATE  = 250
-STIM_DURATION  = 1.2                    
-BASELINE_SEC   = 0.2                    
+parser = argparse.ArgumentParser(description='Train TRCA model')
 
-# Base directory that contains all run-N/ subfolders.
-# The trainer will autom find/load every run-N/ folder inside here,
-# don't have to change inbetween runs
-BASE_DIR = f"data/cyton8_rocket-vep_{N_CLASSES}-class_{STIM_DURATION}s/"
+# folder path, model name, class count
+N_CLASSES   = 5
+N_PER_CLASS = 2
+STIM_DURATION = 1.2
+folder_path = f'data/cyton8_rocket-vep_{N_CLASSES}-class_{STIM_DURATION}s/'
+model_save_dir = 'cache/'
+model_name = 'FBTRCA_rocket_model.pkl'
+sampling_rate = 250
 
-# saves trained model
-MODEL_SAVE_DIR = "cache/"
-MODEL_NAME     = "FBTRCA_rocket_model.pkl"
-
-BASELINE_SAMPLES = int(BASELINE_SEC * SAMPLING_RATE)
-STIM_SAMPLES     = int(STIM_DURATION * SAMPLING_RATE)
-
-# finds all the run-N/ sub folders
-
-if not os.path.isdir(BASE_DIR):
-    raise FileNotFoundError(
-        f"Base data directory not found: {BASE_DIR}\n"
-        "Make sure you have run the game with CALIBRATION_MODE=True, MODE='bci' at least once,\n"
-        f"and that you are launching this script from the project root folder."
-    )
-
+# load from run-N/ subfolders instead of flat run files
 run_dirs = sorted([
-    os.path.join(BASE_DIR, d)
-    for d in os.listdir(BASE_DIR)
-    if d.startswith("run-") and os.path.isdir(os.path.join(BASE_DIR, d))
+    os.path.join(folder_path, d)
+    for d in os.listdir(folder_path)
+    if d.startswith('run-') and os.path.isdir(os.path.join(folder_path, d))
 ])
 
-if len(run_dirs) == 0:
-    raise FileNotFoundError(
-        f"No run-N/ subfolders found inside {BASE_DIR}.\n"
-        "Expected folders named like: run-1/, run-2/, etc."
-    )
-
-print(f"Found {len(run_dirs)} run folder(s): {[os.path.basename(d) for d in run_dirs]}")
-
-# Load and reconstruct trial data from every run folder
-
-# Each run saves eeg_trials as a flat object array of length (N_PER_CLASS * N_CLASSES),
-# shuffled with seed = run_number.  We un-shuffle and reshape to
-# (N_PER_CLASS, N_CLASSES, n_channels, n_samples) before combining.
-
-reverted_list = []
+reverted_eeg_trials_list = []
 
 for run_dir in run_dirs:
-    # Derive the run number from the folder name (e.g. "run-2" -> 2)
-    try:
-        run_number = int(os.path.basename(run_dir).split("-")[1])
-    except (IndexError, ValueError):
-        print(f"  WARNING: Could not parse run number from folder '{run_dir}', skipping.")
-        continue
+    run_number = int(os.path.basename(run_dir).split('-')[1])
 
-    eeg_file = os.path.join(run_dir, "eeg_trials.npy")
-    if not os.path.exists(eeg_file):
-        print(f"  WARNING: eeg_trials.npy not found in {run_dir}, skipping.")
-        continue
-
+    eeg_file = os.path.join(run_dir, 'eeg_trials.npy')
     eeg_trials = np.load(eeg_file, allow_pickle=True)
 
-    # Stack object array -> (N_total, n_channels, n_samples)
-    if isinstance(eeg_trials, np.ndarray) and eeg_trials.dtype == object:
-        eeg_trials = np.stack(eeg_trials)
+    # handle object array with variable-length trials + force float64
+    if eeg_trials.dtype == object:
+        min_samples = min(t.shape[-1] for t in eeg_trials)
+        eeg_trials = np.stack([t[..., :min_samples] for t in eeg_trials]).astype(np.float64)
+    else:
+        eeg_trials = eeg_trials.astype(np.float64)
 
-    print(f"  Loaded run-{run_number}: raw shape {eeg_trials.shape}")
-
-    n_total  = eeg_trials.shape[0]
-    expected = N_PER_CLASS * N_CLASSES
-    if n_total != expected:
-        print(
-            f"  WARNING: expected {expected} trials "
-            f"(N_PER_CLASS={N_PER_CLASS} x N_CLASSES={N_CLASSES}), "
-            f"got {n_total}. Skipping run-{run_number}."
-        )
-        continue
-
-    # Un-shuffle using same seed the game used (seed = RUN = run_number)
     np.random.seed(run_number)
-    shuffled_indices = np.random.permutation(n_total)
-    reverted = np.empty_like(eeg_trials)
-    reverted[shuffled_indices] = eeg_trials
+    shuffled_indices = np.random.permutation(eeg_trials.shape[0])
+    reverted_eeg_trials = np.empty_like(eeg_trials)
+    reverted_eeg_trials[shuffled_indices] = eeg_trials
 
-    # Reshape to (N_PER_CLASS, N_CLASSES, n_channels, n_samples)
-    reverted = reverted.reshape(N_PER_CLASS, N_CLASSES, N_EEG_CHANNELS, -1)
-    reverted_list.append(reverted)
-    print(f"  run-{run_number} reverted shape: {reverted.shape}")
+    # reshape to (N_PER_CLASS, N_CLASSES, 8, n_samples)
+    reverted_eeg_trials = reverted_eeg_trials.reshape(N_PER_CLASS, N_CLASSES, 8, -1)
+    reverted_eeg_trials_list.append(reverted_eeg_trials)
 
-if len(reverted_list) == 0:
-    raise RuntimeError(
-        "No valid trial files could be loaded.\n"
-        f"Checked folders: {run_dirs}\n"
-        "Check your data directory, N_PER_CLASS, and N_CLASSES settings."
-    )
+# Ensure all runs have same sample count before concatenating
+min_run_samples = min(r.shape[-1] for r in reverted_eeg_trials_list)
+reverted_eeg_trials_list = [r[..., :min_run_samples] for r in reverted_eeg_trials_list]
 
-# Concatenate all runs along the reps axis -> (total_reps, N_CLASSES, n_channels, n_samples)
-# e.g. 2 runs x N_PER_CLASS=2 -> (4, 5, 8, 350)
-combined = np.concatenate(reverted_list, axis=0)
-total_reps = combined.shape[0]
-print(f"Combined shape across {len(reverted_list)} run(s): {combined.shape}  "
-      f"({total_reps} reps total = {len(reverted_list)} runs x {N_PER_CLASS} per class)")
+combined_eeg_trials = np.concatenate(reverted_eeg_trials_list, axis=0)
+print("Combined shape:", combined_eeg_trials.shape)
 
-# ---------------------------------------------------------------------------
-# Baseline correction and cropping
-# ---------------------------------------------------------------------------
-
-# Subtract per-trial, per-channel baseline mean
-baseline_mean = np.mean(combined[..., :BASELINE_SAMPLES], axis=-1, keepdims=True)
-combined -= baseline_mean
-
-# Crop out the baseline period — model only sees the stimulus window
-cropped = combined[..., BASELINE_SAMPLES:]   # -> (reps, N_CLASSES, n_channels, stim_samples)
-print(f"Cropped (post-baseline) shape: {cropped.shape}") 
-
-# ---------------------------------------------------------------------------
-# FBTRCA training
-# ---------------------------------------------------------------------------
-
-def run_fbtrca_5class(
-    eeg,
-    stimulus_classes,
-    srate=250,
-    duration=1.2,
-    n_bands=3,
-    ensemble=True,
-    print_acc=True,
-):
-    """
-    Train and LOO-evaluate FBTRCA on a 5-class rocket SSVEP dataset.
-
-    Parameters
-    ----------
-    eeg : np.ndarray, shape (n_reps, n_classes, n_channels, n_samples)
-    stimulus_classes : list of (freq, phase) tuples, length n_classes
-    srate : int
-    duration : float  — stimulus duration in seconds
-    n_bands : int     — number of sub-bands for filterbank
-    ensemble : bool   — use ensemble TRCA
-
-    Returns
-    -------
-    cm    : confusion matrix (normalized)
-    acc   : LOO accuracy
-    model : final fitted FBTRCA model (trained on ALL data)
-    """
+def run_fbtrca(eeg, target_by_trial, target_tab, duration=1, onset_delay=42,srate=300, ensamble=True, return_prob=False,return_template_xcorr=False, return_matching_xcorr=False, print_acc=False):
     eeg = np.copy(eeg)
-    n_reps, n_classes, n_channels, n_samples = eeg.shape
+    np.random.seed(64)
+    np.random.shuffle(eeg)
+    n_trials = eeg.shape[0]
+    classes = range(N_CLASSES)  # was range(32), but now 5 for lanes
+    n_classes = len(classes)
+    y = np.array([list(target_tab.values())] * n_trials).T.reshape(-1)
+    eeg_temp = eeg[:n_trials,classes,:,onset_delay:]
+    X = eeg_temp.swapaxes(0,1).reshape(-1,*eeg_temp.shape[2:])
+    X = X.astype(np.float64)  # CHANGED: force float64 to avoid dtype('O') error in brainda
 
-    # Build label array matching brainda's expected format
-    # y has length n_classes * n_reps, ordered by class
-    target_tab = {
-        tuple(map(float, cls)): idx for idx, cls in enumerate(stimulus_classes)
-    }
-    class_labels = [str(tuple(map(float, cls))) for cls in stimulus_classes]
-
-    y = np.array(class_labels * n_reps)  # repeat class labels for each rep
-
-    # X shape expected by brainda: (n_classes * n_reps, n_channels, n_samples)
-    # Swap axes: (n_reps, n_classes, ...) -> (n_classes, n_reps, ...) -> flatten first two
-    X = eeg.swapaxes(0, 1).reshape(-1, n_channels, n_samples)
-    X = X - np.mean(X, axis=-1, keepdims=True)  # remove DC
-
-    # Filterbank: sub-bands at [8,90], [16,90], [24,90] Hz
-    wp = [[8 * i, 90] for i in range(1, n_bands + 1)]
-    ws = [[8 * i - 2, 95] for i in range(1, n_bands + 1)]
-    filterbank = generate_filterbank(wp, ws, srate, order=4, rp=1)
-    filterweights = np.arange(1, len(filterbank) + 1) ** (-1.25) + 0.25
-
+    n_bands = 3
+    wp = [[8*i, 90] for i in range(1, n_bands+1)]
+    ws = [[8*i-2, 95] for i in range(1, n_bands+1)]
+    filterbank = generate_filterbank(
+        wp, ws, srate, order=4, rp=1)
+    filterweights = np.arange(1, len(filterbank)+1)**(-1.25) + 0.25
     set_random_seeds(64)
+    l = 5
     models = OrderedDict([
-        ("fbtrca", FBTRCA(filterbank, filterweights=filterweights, ensemble=ensemble)),
+        ('fbtrca', FBTRCA(
+            filterbank, filterweights=filterweights,ensemble=ensamble)),
     ])
-
-    # Build metadata for LOO cross-validation
-    subjects = ["1"] * (n_classes * n_reps)
-    events = np.array(class_labels * n_reps)
-    meta = pd.DataFrame(
-        data=np.array([subjects, events]).T,
-        columns=["subject", "event"],
-    )
+    events = []
+    for j_class in classes:
+        events.extend([str(target_by_trial[i_trial][j_class]) for i_trial in range(n_trials)])
+    events = np.array(events)
+    subjects = ['1'] * (n_classes*n_trials)
+    meta = pd.DataFrame(data=np.array([subjects,events]).T, columns=["subject", "event"])
     set_random_seeds(42)
     loo_indices = generate_loo_indices(meta)
 
-    filterX = np.copy(X[..., :int(srate * duration)])
-    filterY = np.copy(y)
+    for model_name in models:
+        if model_name == 'fbtdca':
+            filterX, filterY = np.copy(X[..., :int(srate*duration)+l]), np.copy(y)
+        else:
+            filterX, filterY = np.copy(X[..., :int(srate*duration)]), np.copy(y)
+        
+        filterX = filterX - np.mean(filterX, axis=-1, keepdims=True)
+        filterX = filterX.astype(np.float64)  # CHANGED: ensure float64 after DC removal
 
-    n_loo = len(loo_indices["1"][events[0]])
-    loo_accs = []
-    testYs = []
-    pred_labelss = []
+        n_loo = len(loo_indices['1'][events[0]])
+        prob_matrices=np.zeros((n_loo,n_classes,n_classes))
+        txcorr_matrices=np.zeros((n_loo,n_classes,n_classes))
+        mxcorr_matrices=np.zeros((n_loo,n_classes,n_classes))
+        loo_accs = []
+        testYs = []
+        pred_labelss = []
+        for k in range(n_loo):
+            train_ind, validate_ind, test_ind = match_loo_indices(
+                k, meta, loo_indices)
+            train_ind = np.concatenate([train_ind, validate_ind])
 
-    for k in range(n_loo):
-        train_ind, validate_ind, test_ind = match_loo_indices(k, meta, loo_indices)
-        train_ind = np.concatenate([train_ind, validate_ind])
+            trainX, trainY = filterX[train_ind], filterY[train_ind]
+            testX, testY = filterX[test_ind], filterY[test_ind]
 
-        trainX, trainY = filterX[train_ind], filterY[train_ind]
-        testX, testY = filterX[test_ind], filterY[test_ind]
-
-        fitted_model = clone(models["fbtrca"]).fit(trainX, trainY)
-        pred_labels = fitted_model.predict(testX)
-
-        loo_accs.append(balanced_accuracy_score(testY, pred_labels))
-        pred_labelss.extend(pred_labels)
-        testYs.extend(testY)
-
-    loo_acc = np.mean(loo_accs)
+            model = clone(models[model_name]).fit(
+                trainX, trainY,
+            )
+            if return_template_xcorr:
+                templates = np.copy(model.estimators_[0].templates_)
+                U = np.copy(model.estimators_[0].Us_)[:, :, :model.n_components]
+                U = np.concatenate(U, axis=-1)
+                new_templates=np.zeros((templates.shape[0],templates.shape[0]*templates.shape[2]))
+                for i_template, template in enumerate(templates):
+                    new_templates[i_template] = np.reshape((U.T@template),(-1))
+                templates = np.copy(new_templates)
+                for i in range(n_classes):
+                    for j in range(n_classes):
+                        a1 = templates[i]
+                        a2 = templates[j]
+                        txcorr_matrices[k,i,j] = pearsonr(a1,a2)[0]
+            if return_matching_xcorr:
+                templates = np.copy(model.estimators_[0].templates_)
+                U = np.copy(model.estimators_[0].Us_)[:, :, :model.n_components]
+                U = np.concatenate(U, axis=-1)
+                eegX = model.transform_filterbank(np.copy(testX))[0]
+                new_templates=np.zeros((templates.shape[0],templates.shape[0]*templates.shape[2]))
+                new_eegX = np.zeros((eegX.shape[0],eegX.shape[0]*eegX.shape[2]))
+                for i_template, template in enumerate(templates):
+                    new_templates[i_template] = np.reshape((U.T@template),(-1))
+                templates = np.copy(new_templates)
+                for i_x, x in enumerate(eegX):
+                    new_eegX[i_x] = np.reshape((U.T@x),(-1))
+                eegX = np.copy(new_eegX)
+                for i in range(n_classes):
+                    for j in range(n_classes):
+                        a1 = templates[i]
+                        a2 = eegX[j]
+                        mxcorr_matrices[k,i,j] = pearsonr(a1,a2)[0]
+            if return_prob:
+                prob_matrices[k] = model.transform(testX)
+            pred_labels = model.predict(testX)
+            loo_accs.append(
+                balanced_accuracy_score(testY, pred_labels))
+            pred_labelss.extend(pred_labels)
+            testYs.extend(testY)
     if print_acc:
-        print(f"FBTRCA LOO Accuracy: {loo_acc:.4f} ({loo_acc*100:.1f}%)")
+        print("Model:{} LOO Acc:{:.2f}".format(model_name, np.mean(loo_accs)))
+    if return_template_xcorr:
+        return txcorr_matrices, accuracy_score(testYs, pred_labelss), model
+    if return_matching_xcorr:
+        return mxcorr_matrices, accuracy_score(testYs, pred_labelss), model
+    if return_prob:
+        return prob_matrices, accuracy_score(testYs, pred_labelss)
+    return confusion_matrix(testYs, pred_labelss, normalize='true'), accuracy_score(testYs, pred_labelss), model
 
-    cm = confusion_matrix(testYs, pred_labelss, normalize="true")
+def run_fbtdca(eeg, target_by_trial, target_tab, duration=1.0, onset_delay=42,srate=300, return_prob=True):
+    eeg = np.copy(eeg)
+    np.random.seed(64)
+    np.random.shuffle(eeg)
+    n_trials = eeg.shape[0]
+    classes = range(N_CLASSES)  # CHANGED: was range(32)
+    n_classes = len(classes)
+    prob_matrix=np.zeros((n_classes,n_classes))
+    y = np.array([list(target_tab.values())] * n_trials).T.reshape(-1)
+    eeg_temp = eeg[:n_trials,classes,:,onset_delay:]
+    X = eeg_temp.swapaxes(0,1).reshape(-1,*eeg_temp.shape[2:])
 
-    # --- Retrain on ALL data for the final saved model ---
-    print("Retraining on full dataset for saved model...")
-    final_model = clone(models["fbtrca"]).fit(filterX, filterY)
 
-    return cm, accuracy_score(testYs, pred_labelss), final_model
+    freq_targets = np.array(target_by_trial)[0,:,0]
+    phase_targets = np.array(target_by_trial)[0,:,1]
+    n_harmonics = 5
+    n_bands = 3
+    Yf = generate_cca_references(
+        freq_targets, srate, duration, 
+        phases=phase_targets, 
+        n_harmonics=n_harmonics)
+    wp = [[8*i, 90] for i in range(1, n_bands+1)]
+    ws = [[8*i-2, 95] for i in range(1, n_bands+1)]
+    filterbank = generate_filterbank(
+        wp, ws, srate, order=4, rp=1)
+    filterweights = np.arange(1, len(filterbank)+1)**(-1.25) + 0.25
+    set_random_seeds(64)
+    l = 5
+    models = OrderedDict([
+        ('fbtdca', FBTDCA(
+                filterbank, l, n_components=8, 
+                filterweights=filterweights)),
+    ])
+    events = []
+    for j_class in classes:
+        events.extend([str(target_by_trial[i_trial][j_class]) for i_trial in range(n_trials)])
+    events = np.array(events)
+    subjects = ['1'] * (n_classes*n_trials)
+    meta = pd.DataFrame(data=np.array([subjects,events]).T, columns=["subject", "event"])
+    set_random_seeds(42)
+    loo_indices = generate_loo_indices(meta)
 
+    for model_name in models:
+        if model_name == 'fbtdca':
+            filterX, filterY = np.copy(X[..., :int(srate*duration)+l]), np.copy(y)
+        else:
+            filterX, filterY = np.copy(X[..., :int(srate*duration)]), np.copy(y)
+        
+        filterX = filterX - np.mean(filterX, axis=-1, keepdims=True)
 
-cm, acc, model = run_fbtrca_5class(
-    cropped,
-    STIMULUS_CLASSES,
-    srate=SAMPLING_RATE,
-    duration=STIM_DURATION,
-    ensemble=True,
-    print_acc=True,
-)
+        n_loo = len(loo_indices['1'][events[0]])
+        loo_accs = []
+        testYs = []
+        pred_labelss = []
+        for k in range(n_loo):
+            train_ind, validate_ind, test_ind = match_loo_indices(
+                k, meta, loo_indices)
+            train_ind = np.concatenate([train_ind, validate_ind])
 
-# ---------------------------------------------------------------------------
-# Save model
-# ---------------------------------------------------------------------------
+            trainX, trainY = filterX[train_ind], filterY[train_ind]
+            testX, testY = filterX[test_ind], filterY[test_ind]
 
-os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
-model_path = os.path.join(MODEL_SAVE_DIR, MODEL_NAME)
-with open(model_path, "wb") as f:
+            model = clone(models[model_name]).fit(
+                trainX, trainY,
+                Yf=Yf
+            )
+            if return_prob:
+                prob_matrix+=model.transform(testX)
+            pred_labels = model.predict(testX)
+            loo_accs.append(
+                balanced_accuracy_score(testY, pred_labels))
+            pred_labelss.extend(pred_labels)
+            testYs.extend(testY)
+        
+    if return_prob:
+        return prob_matrix, accuracy_score(testYs, pred_labelss)
+    return confusion_matrix(testYs, pred_labelss, normalize='true'), accuracy_score(testYs, pred_labelss)
+
+# 5 rocket stimulus classes instead of 32
+stimulus_classes = [(8, 0), (10, 0), (12, 0), (14, 0), (15, 0)]
+
+target_tab = {tuple(map(float, cls)): idx for idx, cls in enumerate(stimulus_classes)}
+target_by_trial = [stimulus_classes] * 99
+
+sampling_rate = 250
+baseline_duration = 0.2
+baseline_samples = int(baseline_duration * sampling_rate)
+
+baseline_average = np.mean(combined_eeg_trials[:, :, :, :baseline_samples], axis=3, keepdims=True)
+baseline_corrected_eeg_trials = combined_eeg_trials - baseline_average
+cropped_eeg_trials = combined_eeg_trials[:, :, :, baseline_samples:]
+
+cm, acc, model = run_fbtrca(cropped_eeg_trials, target_by_trial, target_tab, duration=1.2, onset_delay=0, ensamble=True, print_acc=True, srate=250)
+
+os.makedirs(model_save_dir, exist_ok=True)
+with open(model_save_dir + model_name, 'wb') as f:
     pickle.dump(model, f)
-print(f"Model saved to: {model_path}")
-print(f"Point MODEL_PATH in run_rocket.py to: {model_path}")
-
-# ---------------------------------------------------------------------------
-# Plot confusion matrix
-# ---------------------------------------------------------------------------
-
-fig, ax = plt.subplots(figsize=(6, 5))
-im = ax.imshow(cm, vmin=0, vmax=1, cmap="Blues")
-plt.colorbar(im, ax=ax)
-class_names = [f"{f}Hz φ{p}" for f, p in STIMULUS_CLASSES]
-ax.set_xticks(range(N_CLASSES))
-ax.set_yticks(range(N_CLASSES))
-ax.set_xticklabels(class_names, rotation=45, ha="right")
-ax.set_yticklabels(class_names)
-ax.set_xlabel("Predicted")
-ax.set_ylabel("True")
-ax.set_title(f"FBTRCA 5-class LOO Confusion Matrix\nAccuracy: {acc*100:.1f}%")
-for i in range(N_CLASSES):
-    for j in range(N_CLASSES):
-        ax.text(j, i, f"{cm[i,j]:.2f}", ha="center", va="center",
-                color="white" if cm[i, j] > 0.5 else "black", fontsize=9)
-plt.tight_layout()
-plt.savefig(os.path.join(MODEL_SAVE_DIR, "rocket_confusion_matrix.png"), dpi=150)
-print(f"Confusion matrix saved to: {MODEL_SAVE_DIR}rocket_confusion_matrix.png")
-plt.show()
