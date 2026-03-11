@@ -588,6 +588,7 @@ try:
                 target_lane = random.randint(0, LANES - 1)
             crashed = movement_phase(target_lane)
             if crashed:
+                save_data()
                 game_over_screen()
                 crash_count  = 0
                 current_lane = 2
