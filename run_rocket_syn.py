@@ -12,9 +12,9 @@ USE_SYNTHETIC = False  # set True to test w/brainflow synthetic board (no hardwa
 lsl_out = False
 
 MODE = "bci" # "testing (keyboard controls)" or "bci"
-CALIBRATION_MODE = True
+CALIBRATION_MODE = False
 N_PER_CLASS = 2
-RUN = 3
+RUN = 4
 LANES = 5
 
 
@@ -27,6 +27,7 @@ refresh_rate = 60.02
 stim_duration = 1.2
 baseline_duration = 0.2
 baseline_duration_samples = int(baseline_duration * 250)
+num_obstacles = 4
 PRE_STIM_PAUSE = 0.6
 N_EEG_CHANNELS = 8
 
@@ -310,8 +311,16 @@ def save_data():
     os.makedirs(save_dir, exist_ok=True)
     np.save(save_file_eeg,        eeg)
     np.save(save_file_aux,        aux)
-    np.save(save_file_eeg_trials, np.array(eeg_trials, dtype=object))
-    np.save(save_file_aux_trials, np.array(aux_trials, dtype=object))
+
+    eeg_arr = np.empty(len(eeg_trials), dtype=object)
+    for i, t in enumerate(eeg_trials):
+        eeg_arr[i] = t
+    aux_arr = np.empty(len(aux_trials), dtype=object)
+    for i, t in enumerate(aux_trials):
+        aux_arr[i] = t
+
+    np.save(save_file_eeg_trials, eeg_arr)
+    np.save(save_file_aux_trials, aux_arr)
     np.save(save_file_labels,     np.array(labels))
 
 def collect_trial_eeg(i_trial):
@@ -338,14 +347,67 @@ def collect_trial_eeg(i_trial):
         trial_starts  = np.where(np.diff(photo_trigger) == 1)[0]
         trial_ends    = np.where(np.diff(photo_trigger) == -1)[0]
 
-    print('total: ', eeg.shape, aux.shape, timestamp.shape)
     trial_start    = trial_starts[i_trial + skip_count] - baseline_duration_samples
     trial_duration = int(stim_duration * sampling_rate) + baseline_duration_samples
-    filtered_eeg   = mne.filter.filter_data(eeg, sfreq=sampling_rate, l_freq=2, h_freq=40, verbose=False)
+
+    # Wait for enough data after trial_start to fill a complete trial
+    while eeg.shape[1] < trial_start + trial_duration:
+        while not queue_in.empty():
+            eeg_in, aux_in, timestamp_in = queue_in.get()
+            eeg       = np.concatenate((eeg, eeg_in),             axis=1)
+            aux       = np.concatenate((aux, aux_in),             axis=1)
+            timestamp = np.concatenate((timestamp, timestamp_in), axis=0)
+        core.wait(0.05)
+
+    print('total: ', eeg.shape, aux.shape, timestamp.shape)
+    # mne filter needs enough samples; skip filtering if buffer is too short
+    if eeg.shape[1] >= sampling_rate:
+        filtered_eeg = mne.filter.filter_data(eeg, sfreq=sampling_rate, l_freq=2, h_freq=40, verbose=False)
+    else:
+        filtered_eeg = eeg.copy()
     trial_eeg      = np.copy(filtered_eeg[:, trial_start:trial_start + trial_duration])
     trial_aux      = np.copy(aux[:,          trial_start:trial_start + trial_duration])
+
+
+    # while len(trial_ends) <= i_trial + skip_count:
+    #     while not queue_in.empty():
+    #         eeg_in, aux_in, timestamp_in = queue_in.get()
+    #         print('data-in: ', eeg_in.shape, aux_in.shape, timestamp_in.shape)
+    #         eeg       = np.concatenate((eeg, eeg_in),             axis=1)
+    #         aux       = np.concatenate((aux, aux_in),             axis=1)
+    #         timestamp = np.concatenate((timestamp, timestamp_in), axis=0)
+    #     photo_trigger = (aux[1] > 20).astype(int)
+    #     trial_starts  = np.where(np.diff(photo_trigger) == 1)[0]
+    #     trial_ends    = np.where(np.diff(photo_trigger) == -1)[0]
+
+    # print('total: ', eeg.shape, aux.shape, timestamp.shape)
+    # trial_start    = trial_starts[i_trial + skip_count] - baseline_duration_samples
+    # trial_duration = int(stim_duration * sampling_rate) + baseline_duration_samples
+    # # mne filter needs enough samples; skip filtering if buffer is too short
+    # if eeg.shape[1] >= sampling_rate:
+    #     filtered_eeg = mne.filter.filter_data(eeg, sfreq=sampling_rate, l_freq=2, h_freq=40, verbose=False)
+    # else:
+    #     filtered_eeg = eeg.copy()
+
+    # #filtered_eeg   = mne.filter.filter_data(eeg, sfreq=sampling_rate, l_freq=2, h_freq=40, verbose=False)
+    # trial_eeg      = np.copy(filtered_eeg[:, trial_start:trial_start + trial_duration])
+    # trial_aux      = np.copy(aux[:,          trial_start:trial_start + trial_duration])
+    print(f'trial {i_trial}: ', trial_eeg.shape, trial_aux.shape)
+
+    # Force exact trial length so all trials have identical shape
+    if trial_eeg.shape[1] < trial_duration:
+        pad_n = trial_duration - trial_eeg.shape[1]
+        trial_eeg = np.pad(trial_eeg, ((0,0),(0,pad_n)), mode='constant')
+        trial_aux = np.pad(trial_aux, ((0,0),(0,pad_n)), mode='constant')
+    elif trial_eeg.shape[1] > trial_duration:
+        trial_eeg = trial_eeg[:, :trial_duration]
+        trial_aux = trial_aux[:, :trial_duration]
+    
     print(f'trial {i_trial}: ', trial_eeg.shape, trial_aux.shape)
     baseline_average = np.mean(trial_eeg[:, :baseline_duration_samples], axis=1, keepdims=True)
+
+#    print(f'trial {i_trial}: ', trial_eeg.shape, trial_aux.shape)
+#    baseline_average = np.mean(trial_eeg[:, :baseline_duration_samples], axis=1, keepdims=True)
     trial_eeg       -= baseline_average
     eeg_trials.append(trial_eeg)
     aux_trials.append(trial_aux)
@@ -370,7 +432,7 @@ def game_over_screen():
         window.flip()
 
 def obstacle_warning_phase():
-    blocked = set(random.sample(range(LANES), 2))
+    blocked = set(random.sample(range(LANES), num_obstacles))
     spawn_obstacles(blocked)
     t0 = core.getTime()
     while core.getTime() - t0 < 0.8:
